@@ -41,22 +41,8 @@ struct Settings {
     /// "system", "light" or "dark"
     theme: String,
     reduce_motion: bool,
-    /// How to open each kind of file: "text", "image", "video", "audio", "other".
+    /// How to open each kind of file: "text", "image", "video", "audio", "pdf", "sheet", "other".
     openers: HashMap<String, Opener>,
-    // Before openers existed; read once to migrate, never written again.
-    #[serde(skip_serializing)]
-    editor: String,
-    #[serde(skip_serializing)]
-    editor_command: String,
-}
-
-impl Settings {
-    fn migrated(mut self) -> Self {
-        if self.editor == "external" && !self.openers.contains_key("text") {
-            self.openers.insert("text".into(), Opener { mode: "custom".into(), command: self.editor_command.clone() });
-        }
-        self
-    }
 }
 
 /// Reads JSON, moving an unreadable file aside instead of overwriting it on the next save.
@@ -130,7 +116,7 @@ impl App {
             history: Mutex::new(read_json(&history_file)),
             history_file,
             profiles: Mutex::new(read_json(&file)),
-            settings: Mutex::new(read_json::<Settings>(&settings_file).migrated()),
+            settings: Mutex::new(read_json(&settings_file)),
             file,
             settings_file,
             clients: Mutex::default(),
@@ -319,7 +305,9 @@ fn get_settings(app: State<App>) -> Settings {
 
 #[tauri::command]
 fn save_settings(app: State<App>, settings: Settings) -> Res<()> {
-    for (kind, o) in &settings.openers {
+    let saved = app.settings.lock().unwrap().openers.clone();
+    // Only openers that change are checked, so an app uninstalled later doesn't block other settings.
+    for (kind, o) in settings.openers.iter().filter(|(k, o)| saved.get(*k).is_none_or(|s| s.mode != o.mode || s.command != o.command)) {
         match o.mode.as_str() {
             "builtin" | "system" | "download" => {}
             "custom" => {
@@ -622,8 +610,11 @@ async fn with_progress<T>(prog: &Progress, ch: &Channel<Tick>, work: impl Future
 #[tauri::command]
 async fn upload_conflicts(app: State<'_, App>, id: String, paths: Vec<PathBuf>, prefix: String) -> Res<Vec<String>> {
     let (c, bucket) = app.conn(&id)?;
-    // An existing empty-folder marker is identical to the new one, so it is no conflict.
-    let mut keys: Vec<String> = s3::existing(&c, &bucket, &paths, &prefix).await?.into_iter().filter(|k| !k.ends_with('/')).collect();
+    let (p, pre) = (paths.clone(), prefix.clone());
+    let planned = tokio::task::spawn_blocking(move || s3::collect_uploads(&p, &pre)).await.map_err(|e| e.to_string())??;
+    let existing = s3::existing(&c, &bucket, &paths, &prefix).await?;
+    // Only files this upload would write; an existing empty-folder marker is identical to the new one.
+    let mut keys: Vec<String> = planned.into_iter().map(|f| f.1).filter(|k| !k.ends_with('/') && existing.contains(k)).collect();
     keys.sort();
     Ok(keys)
 }
@@ -677,10 +668,17 @@ async fn upload(
     let prog = Arc::new(Progress::default());
     let _registered = Registered::new(&app, transfer_id, prog.clone());
     prog.total.store(files.iter().map(|f| f.2).sum(), Ordering::Relaxed);
-    prog.files_total.store(files.len() as u64, Ordering::Relaxed);
+    // Folder entries (empty folders, key ending in "/") are created, not counted as files.
+    prog.files_total.store(files.iter().filter(|f| !f.1.ends_with('/')).count() as u64, Ordering::Relaxed);
     let work = s3::run_parallel(files, prog.clone(), |(path, key, size)| {
         let (c, bucket, prog) = (&c, &bucket, &*prog);
-        async move { s3::upload_entry(c, bucket, &path, &key, size, prog).await.map_err(|e| format!("{key}: {e}")) }
+        async move {
+            let r = s3::upload_entry(c, bucket, &path, &key, size, prog).await;
+            if !key.ends_with('/') {
+                prog.files.fetch_add(1, Ordering::Relaxed);
+            }
+            r.map_err(|e| format!("{key}: {e}"))
+        }
     });
     let failed = with_progress(&prog, &on_progress, work).await;
     if prog.cancelled.load(Ordering::Relaxed) {
@@ -704,10 +702,17 @@ async fn download(
     let prog = Arc::new(Progress::default());
     let _registered = Registered::new(&app, transfer_id, prog.clone());
     prog.total.store(plan.iter().map(|f| f.2).sum(), Ordering::Relaxed);
-    prog.files_total.store(plan.len() as u64, Ordering::Relaxed);
+    // Folder entries (key ending in "/") are created, not counted as files.
+    prog.files_total.store(plan.iter().filter(|f| !f.0.ends_with('/')).count() as u64, Ordering::Relaxed);
     let work = s3::run_parallel(plan, prog.clone(), |(key, path, _)| {
         let (c, bucket, prog) = (&c, &bucket, &*prog);
-        async move { s3::download_entry(c, bucket, &key, &path, prog).await.map_err(|e| format!("{key}: {e}")) }
+        async move {
+            let r = s3::download_entry(c, bucket, &key, &path, prog).await;
+            if !key.ends_with('/') {
+                prog.files.fetch_add(1, Ordering::Relaxed);
+            }
+            r.map_err(|e| format!("{key}: {e}"))
+        }
     });
     let failed = with_progress(&prog, &on_progress, work).await;
     if prog.cancelled.load(Ordering::Relaxed) {

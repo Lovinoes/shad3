@@ -40,6 +40,42 @@ fn unhex(s: &str) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
+/// Response header block. CORS because the app page runs on another origin (tauri://localhost)
+/// and the PDF and spreadsheet viewers fetch() the file. Safe: nothing is served without the token.
+fn head(status: &str, extra: &str) -> String {
+    format!(
+        "HTTP/1.1 {status}\r\nConnection: close\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\n\
+         Access-Control-Expose-Headers: Content-Range, Content-Length, Accept-Ranges\r\n{extra}\r\n"
+    )
+}
+
+fn fail(status: &str, msg: &str) -> String {
+    format!("{}{msg}", head(status, &format!("Content-Type: text/plain\r\nContent-Length: {}\r\n", msg.len())))
+}
+
+/// Checks a request line ("GET /<token>/<id>/<hex key> HTTP/1.1"). Ok: what to serve.
+/// Err: the complete response to send instead (refusal, or the answer to a CORS preflight).
+fn route<'a>(line: &'a str, token: &str) -> Result<(&'a str, &'a str, String), String> {
+    let mut parts = line.split_whitespace();
+    let (method, target) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+    let mut segs = target.trim_start_matches('/').split('/');
+    let (tok, id, key) = (segs.next(), segs.next(), segs.next().and_then(unhex));
+    if tok != Some(token) {
+        return Err(fail("403 Forbidden", "bad token"));
+    }
+    if method == "OPTIONS" {
+        // Preflight for Range requests.
+        return Err(head("204 No Content", "Access-Control-Allow-Methods: GET, HEAD\r\nAccess-Control-Allow-Headers: Range\r\nAccess-Control-Max-Age: 600\r\n"));
+    }
+    if method != "GET" && method != "HEAD" {
+        return Err(fail("405 Method Not Allowed", "GET only"));
+    }
+    match (id, key) {
+        (Some(id), Some(key)) if !id.is_empty() => Ok((method, id, key)),
+        _ => Err(fail("400 Bad Request", "bad path")),
+    }
+}
+
 async fn handle(app: AppHandle, token: Arc<String>, mut sock: TcpStream) {
     let (r, mut w) = sock.split();
     let mut reader = BufReader::new(r);
@@ -61,33 +97,16 @@ async fn handle(app: AppHandle, token: Arc<String>, mut sock: TcpStream) {
             }
         }
     }
-    let mut parts = line.split_whitespace();
-    let (method, target) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
-    let mut segs = target.trim_start_matches('/').split('/');
-    let (tok, id, key) = (segs.next(), segs.next(), segs.next().and_then(unhex));
-
-    // The app page runs on another origin (tauri://localhost), so viewers that fetch() the file
-    // (PDF, spreadsheets) need CORS. Safe: nothing is served without the secret token.
-    let head = |status: &str, extra: &str| {
-        format!(
-            "HTTP/1.1 {status}\r\nConnection: close\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\n\
-             Access-Control-Expose-Headers: Content-Range, Content-Length, Accept-Ranges\r\n{extra}\r\n"
-        )
+    let (method, id, key) = match route(&line, &token) {
+        Ok(r) => r,
+        Err(response) => {
+            let _ = w.write_all(response.as_bytes()).await;
+            let _ = w.shutdown().await;
+            return;
+        }
     };
-    let fail = |status: &str, msg: &str| format!("{}{msg}", head(status, &format!("Content-Type: text/plain\r\nContent-Length: {}\r\n", msg.len())));
 
     let reply = async {
-        if tok != Some(token.as_str()) {
-            return Err(fail("403 Forbidden", "bad token"));
-        }
-        if method == "OPTIONS" {
-            // Preflight for Range requests.
-            return Err(head("204 No Content", "Access-Control-Allow-Methods: GET, HEAD\r\nAccess-Control-Allow-Headers: Range\r\nAccess-Control-Max-Age: 600\r\n"));
-        }
-        if method != "GET" && method != "HEAD" {
-            return Err(fail("405 Method Not Allowed", "GET only"));
-        }
-        let (Some(id), Some(key)) = (id, key) else { return Err(fail("400 Bad Request", "bad path")) };
         let (c, bucket) = app.state::<App>().conn(id).map_err(|e| fail("404 Not Found", &e))?;
         let o = c.get_object().bucket(&bucket).key(&key).set_range(range).send().await.map_err(|e| fail("502 Bad Gateway", &crate::s3::fmt_err(e)))?;
         // The extension is more reliable than what uploaders set (often application/octet-stream).
@@ -100,7 +119,7 @@ async fn handle(app: AppHandle, token: Arc<String>, mut sock: TcpStream) {
             }
             None => "200 OK",
         };
-        Ok((head(status, &extra), o.body))
+        Ok::<_, String>((head(status, &extra), o.body))
     }
     .await;
 
@@ -131,5 +150,23 @@ mod tests {
         assert_eq!(super::unhex("6"), None);
         assert_eq!(super::unhex("zz"), None);
         assert_eq!(super::unhex(&super::hex("dir/ä b.mp4")).as_deref(), Some("dir/ä b.mp4"));
+    }
+
+    /// The token is the only thing keeping other programs out of the buckets.
+    #[test]
+    fn route() {
+        let key = super::hex("dir/ä.pdf");
+        let r = |line: String| super::route(&line, "secret").map(|(m, i, k)| (m.to_string(), i.to_string(), k));
+        let status = |line: String| r(line).unwrap_err()[9..12].to_string();
+        assert_eq!(r(format!("GET /secret/id1/{key} HTTP/1.1\r\n")), Ok(("GET".into(), "id1".into(), "dir/ä.pdf".into())));
+        assert_eq!(status(format!("GET /wrong/id1/{key} HTTP/1.1")), "403");
+        assert_eq!(status(format!("GET /secretX/id1/{key} HTTP/1.1")), "403");
+        assert_eq!(status(format!("OPTIONS /wrong/id1/{key} HTTP/1.1")), "403");
+        assert_eq!(status(format!("POST /secret/id1/{key} HTTP/1.1")), "405");
+        assert_eq!(status("GET /secret/id1/zz HTTP/1.1".into()), "400");
+        assert_eq!(status(format!("GET /secret//{key} HTTP/1.1")), "400");
+        let preflight = r(format!("OPTIONS /secret/id1/{key} HTTP/1.1")).unwrap_err();
+        assert!(preflight.starts_with("HTTP/1.1 204") && preflight.contains("Access-Control-Allow-Headers: Range"));
+        assert!(preflight.contains("Access-Control-Allow-Origin: *"));
     }
 }

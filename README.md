@@ -1,26 +1,14 @@
 # shad3
 
-shad3 is a simple, fast S3 browser for Linux and Windows (x64 only). Rust ([Tauri 2](https://tauri.app) + AWS SDK) backend, React + Tailwind frontend.
+A simple S3 browser for Linux (and Windows), styled to match my site ([lovinoes.de](https://lovinoes.de)).
 
-Works with Amazon S3 and anything S3-compatible: Cloudflare R2, Backblaze B2, Wasabi, DigitalOcean Spaces, Hetzner, MinIO, Garage, Ceph…
+Works with AWS S3 and anything S3-compatible: Cloudflare R2, Backblaze B2, Hetzner, Wasabi, MinIO etc.
 
-- Add buckets in the sidebar (provider presets or "Other"), with **Test connection** and an offer to create the bucket if it is missing
-- Browse folders, create files and folders (right-click → New file / New folder), rename and delete them
-- Upload files and folders (button or drag & drop from your file manager); if names already exist you choose Replace, Keep both (adds a number) or Skip per file, or once for all. Download files and folders
-- Parallel multipart uploads for big files, progress in the sidebar; × cancels a running transfer
-- Right-click → Properties (Alt+Enter): size, type, ETag, storage class, encryption, headers and custom metadata; for folders the number of files and total size
-- Edit text files in the built-in editor or in your own editor (Settings ⚙, pick it by name or Browse to its path): every save there is uploaded again. Edits never silently overwrite a file someone else changed meanwhile
-- View images (zoom with wheel or + / −, drag to move, rotate, flip, 1:1 / fit), play videos and audio (seek, volume) right from the bucket, streamed; ← / → step through a folder. What plays depends on your system's codecs; on Fedora, H.264/H.265 video needs the codec packages from RPM Fusion
-- Settings (⚙): light / dark / system theme, animations on or off, and per file type (text, pictures, videos, audio, other) open with the built-in viewer, your desktop's default app, or any program (e.g. VLC, which streams the file directly)
-- Credits and licenses of every open-source component shad3 bundles (all Rust crates and npm packages, fonts, shadcn/ui) are under Settings → About
-- Built-in PDF viewer (pdf.js) and spreadsheet viewer (SheetJS: xlsx, xls, ods, numbers)
-- Activity history: recent actions bottom left, the full list with filters under Settings → History
-- Select many files with the checkboxes on the left, by dragging a selection box, or with Ctrl / Shift click
-- Keyboard: `Enter` open / edit, `Ctrl+S` save in the editor, `Backspace` up, `F2` rename, `Del` delete, `Ctrl+A` select all, `F5` refresh
+Built with Tauri, Rust and React. x64 only.
 
-Secret keys are stored encrypted in your system keyring (KWallet or GNOME Keyring via the Secret Service API; Credential Manager on Windows) and never reach the UI. The rest of each connection (bucket, endpoint, region, access key) is in `~/.config/de.lovinoes.shad3/profiles.json` (Windows: `%APPDATA%\de.lovinoes.shad3`).
+## Building
 
-## Build
+You need Node and Rust, plus these packages.
 
 Fedora:
 
@@ -38,13 +26,21 @@ Then:
 
 ```bash
 npm install
-npm run tauri dev      # run while developing
-npm run tauri build -- --bundles rpm,deb,appimage   # in src-tauri/target/release/bundle/
+npm run tauri dev
 ```
 
-### Windows
+To build the `.rpm`, `.deb` and AppImage (they end up in `src-tauri/target/release/bundle/`):
 
-Windows installers (`.exe` and `.msi`) are built by GitHub Actions (`.github/workflows/build.yml`): push a tag like `v0.1.0` or start the workflow from the Actions tab, then download the artifacts. It builds the Linux packages too. To build on a Windows PC instead, install the [Tauri prerequisites](https://tauri.app/start/prerequisites/) and run `npm install && npm run tauri build -- --bundles nsis,msi`.
+```bash
+npm run tauri build -- --bundles rpm,deb,appimage
+```
+
+The Windows installers are built by GitHub Actions. Push a tag like `v0.1.0` or run the workflow by hand.
+
+## Good to know
+
+- Secret keys are stored in your system keyring (GNOME Keyring, KWallet, or Credential Manager on Windows). Everything else is in `~/.config/de.lovinoes.shad3/`.
+- Videos play with your system's codecs. On Fedora, H.264 and H.265 need the codecs from RPM Fusion.
 
 ## Tests
 
@@ -52,20 +48,16 @@ Windows installers (`.exe` and `.msi`) are built by GitHub Actions (`.github/wor
 cd src-tauri && cargo test
 ```
 
-The server test runs only when `S3_TEST_ENDPOINT` is set, for example against a local MinIO:
+One test talks to a real S3 server and only runs when you point it at one:
 
 ```bash
 S3_TEST_ENDPOINT=http://127.0.0.1:9000 S3_TEST_KEY=minioadmin S3_TEST_SECRET=minioadmin cargo test
 ```
 
-## Licenses of bundled components
+## Licenses
 
-`src/licenses/third-party.json` lists every crate and npm package that ships in the app, with its license texts. Regenerate it after changing dependencies:
+The licenses of everything shad3 ships with are in the app under Settings → About. After changing dependencies, update that list with:
 
 ```bash
 npm run credits
 ```
-
-## Credits
-
-App icon and UI icons: [Lucide](https://lucide.dev) (ISC License). Font: Chakra Petch (SIL Open Font License).

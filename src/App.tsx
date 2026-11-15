@@ -390,6 +390,12 @@ function Transfers({ items, onClear, onDismiss }: { items: Transfer[]; onClear: 
 
 /** Bottom-left list of the latest actions; collapsible, remembered per device. */
 function RecentActivity({ items, onViewAll }: { items: HistoryEntry[]; onViewAll: () => void }) {
+  // Re-render once a minute so "now" / "5m" stay true while the app sits idle.
+  const [, tick] = useState(0);
+  useEffect(() => {
+    const t = setInterval(() => tick((n) => n + 1), 60_000);
+    return () => clearInterval(t);
+  }, []);
   const [open, setOpen] = useState(() => {
     try {
       return localStorage.getItem("s3b:recent") !== "closed";

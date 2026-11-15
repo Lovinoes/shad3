@@ -3,7 +3,8 @@ import { useEffect, useMemo, useState } from "react";
 import { read, utils, type WorkBook } from "xlsx";
 import { cn } from "./ui";
 
-const MAX_BYTES = 50 * 1024 * 1024;
+// Parsing runs on the UI thread; a bigger workbook would freeze the window for seconds.
+const MAX_BYTES = 10 * 1024 * 1024;
 // shortcut: shows the first rows/columns only; virtualize the grid if huge sheets must be browsed here.
 const MAX_ROWS = 5000;
 const MAX_COLS = 200;

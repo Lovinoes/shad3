@@ -69,7 +69,8 @@ export function Browser({
   const [filter, setFilter] = useState("");
   const [sort, setSort] = useState<{ key: SortKey; asc: boolean }>({ key: "name", asc: true });
   const [selected, setSelected] = useState<Set<string>>(new Set());
-  const [anchor, setAnchor] = useState<number | null>(null);
+  // The row shift-click extends from, kept by key so sorting or filtering can't move it.
+  const [anchorKey, setAnchorKey] = useState<string | null>(null);
   const [menu, setMenu] = useState<{ x: number; y: number; n: number } | null>(null);
   const [dialog, setDialog] = useState<null | "folder" | "file" | "rename" | "delete">(null);
   const [dragging, setDragging] = useState(false);
@@ -120,6 +121,9 @@ export function Browser({
         return (d || a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" })) * dir;
       });
   }, [entries, filter, sort]);
+  const anchorAt = anchorKey === null ? -1 : rows.findIndex((r) => r.key === anchorKey);
+  const anchor = anchorAt >= 0 ? anchorAt : null;
+  const setAnchor = (i: number | null) => setAnchorKey(i === null ? null : (rows[i]?.key ?? null));
 
   const sel = rows.filter((e) => selected.has(e.key));
   const single = sel.length === 1 ? sel[0] : null;
@@ -152,7 +156,7 @@ export function Browser({
       detail: cancelled ? "Files finished before the cancel stay in the bucket" : failed.length ? `${failed.length} failed: ${failed[0]}` : `to /${target}`,
       ok: !failed.length,
     });
-    load();
+    actRef.current.load(); // the folder shown now, which may not be the one uploaded into
   };
   const pickUpload = async (directory: boolean) => {
     const res = await openDialog({ multiple: true, directory, title: directory ? "Upload folders" : "Upload files" });

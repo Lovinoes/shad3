@@ -136,7 +136,9 @@ where
         },
         (Some("InvalidAccessKeyId"), _) => "Access key not recognized by the server".into(),
         (Some("SignatureDoesNotMatch"), _) => "Secret key is wrong (signature mismatch)".into(),
-        (Some("NoSuchBucket"), _) | (None, Some(404)) => "Bucket does not exist".into(),
+        (Some("NoSuchBucket"), _) => "Bucket does not exist".into(),
+        // HEAD answers carry no error code, so a 404 is usually a file, not the bucket.
+        (None, Some(404)) => "Not found (it may have been deleted or renamed)".into(),
         (Some("NoSuchKey"), _) => "File not found (it may have been deleted or renamed)".into(),
         (Some("AccessDenied"), _) | (None, Some(403)) => {
             "Access denied: check the keys and the bucket permissions".into()
@@ -441,6 +443,12 @@ pub fn collect_uploads(paths: &[PathBuf], prefix: &str) -> Result<Vec<(PathBuf, 
             let mut empty = true;
             for e in std::fs::read_dir(p)? {
                 let e = e?;
+                // A link to a folder could point at / or a parent (e.g. Wine's dosdevices/z:) and
+                // upload the whole disk; a broken link (e.g. Emacs's .#file locks) can't be read.
+                // Only links to files are followed.
+                if e.file_type()?.is_symlink() && !e.path().is_file() {
+                    continue;
+                }
                 empty = false;
                 walk(&e.path(), format!("{key}/{}", e.file_name().to_string_lossy()), out)?;
             }
@@ -768,7 +776,8 @@ pub async fn download_file(c: &Client, bucket: &str, key: &str, dest: &Path, pro
     res
 }
 
-/// Runs jobs a few at a time, keeps going past failures, and returns the failures.
+/// Runs jobs a few at a time, keeps going past failures, and returns the failures. The jobs count
+/// finished files in `prog` themselves (they know which entries are files).
 pub async fn run_parallel<T, F, Fut>(items: Vec<T>, prog: Arc<Progress>, f: F) -> Vec<String>
 where
     F: Fn(T) -> Fut,
@@ -782,9 +791,7 @@ where
                 if prog.cancelled.load(Ordering::Relaxed) {
                     return None; // not started; the caller reports the cancel once
                 }
-                let r = fut.await;
-                prog.files.fetch_add(1, Ordering::Relaxed);
-                r.err().filter(|e| e != CANCELLED)
+                fut.await.err().filter(|e| e != CANCELLED)
             }
         })
         .buffer_unordered(PARALLEL)
@@ -812,11 +819,29 @@ mod tests {
         for d in ["up/empty", "up/sub/emptier", "lonely"] {
             std::fs::create_dir_all(tmp.join(d)).unwrap();
         }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            symlink(&tmp, tmp.join("up/loop")).unwrap(); // a loop: must not be followed
+            symlink("/nonexistent/target", tmp.join("up/.#a.txt")).unwrap(); // broken: skipped
+            std::fs::create_dir_all(tmp.join("only-links")).unwrap();
+            symlink(&tmp, tmp.join("only-links/loop")).unwrap(); // nothing to upload inside
+            symlink(tmp.join("up/a.txt"), tmp.join("up/sub/link-to-a.txt")).unwrap(); // file link: kept
+        }
         std::fs::write(tmp.join("up/a.txt"), "a").unwrap();
         std::fs::write(tmp.join("up/sub/b.txt"), "bb").unwrap();
-        let mut got: Vec<(String, u64)> = collect_uploads(&[tmp.join("up"), tmp.join("lonely")], "p/").unwrap().into_iter().map(|(_, k, s)| (k, s)).collect();
+        let mut got: Vec<(String, u64)> =
+            collect_uploads(&[tmp.join("up"), tmp.join("lonely"), tmp.join("only-links")], "p/").unwrap().into_iter().map(|(_, k, s)| (k, s)).collect();
         got.sort();
-        let want = [("p/lonely/", 0), ("p/up/a.txt", 1), ("p/up/empty/", 0), ("p/up/sub/b.txt", 2), ("p/up/sub/emptier/", 0)];
+        let want = [
+            ("p/lonely/", 0),
+            ("p/only-links/", 0),
+            ("p/up/a.txt", 1),
+            ("p/up/empty/", 0),
+            ("p/up/sub/b.txt", 2),
+            ("p/up/sub/emptier/", 0),
+            ("p/up/sub/link-to-a.txt", 1),
+        ];
         assert_eq!(got, want.map(|(k, s)| (k.to_string(), s)));
         std::fs::remove_dir_all(&tmp).unwrap();
         assert_eq!(numbered("a/photo.jpg", 1), "a/photo (1).jpg");
@@ -882,7 +907,8 @@ mod tests {
         let pasted = Profile { endpoint: format!("{}/{}/folder", p.endpoint, p.bucket), path_style: false, ..p.clone() };
         let t = test(&pasted).await;
         assert!(t.ok, "{}", t.message);
-        assert_eq!(t.fixed.as_ref().map(|f| (f.endpoint.as_str(), f.path_style)), Some((p.endpoint.as_str(), true)), "{}", t.message);
+        // Path-style may stay off: the SDK already uses it for IP-address endpoints.
+        assert_eq!(t.fixed.as_ref().map(|f| f.endpoint.as_str()), Some(p.endpoint.as_str()), "{}", t.message);
         let bad = Profile { secret_key: "wrong".into(), ..p.clone() };
         assert!(test(&bad).await.message.contains("Secret key"), "{}", test(&bad).await.message);
 
