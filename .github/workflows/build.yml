@@ -1,0 +1,64 @@
+name: build
+
+# Runs on tags like v0.1.0 or by hand from the Actions tab; packages land as workflow artifacts.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Ubuntu 22.04 keeps the .deb and AppImage compatible with older glibc.
+          - os: ubuntu-22.04
+            bundles: deb,rpm,appimage
+          - os: windows-latest
+            bundles: nsis,msi
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake libwebkit2gtk-4.1-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libdbus-1-dev pkg-config patchelf
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu,x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - run: npm ci
+
+      - name: Test
+        if: runner.os == 'Linux'
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: Build (x64)
+        shell: bash
+        run: |
+          target=$([ "$RUNNER_OS" = Windows ] && echo x86_64-pc-windows-msvc || echo x86_64-unknown-linux-gnu)
+          npx tauri build --target "$target" --bundles ${{ matrix.bundles }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shad3-${{ runner.os }}-x64
+          path: |
+            src-tauri/target/*/release/bundle/deb/*.deb
+            src-tauri/target/*/release/bundle/rpm/*.rpm
+            src-tauri/target/*/release/bundle/appimage/*.AppImage
+            src-tauri/target/*/release/bundle/nsis/*.exe
+            src-tauri/target/*/release/bundle/msi/*.msi
+          if-no-files-found: error

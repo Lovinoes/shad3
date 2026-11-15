@@ -1,0 +1,28 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "shad3",
+  "version": "0.1.0",
+  "identifier": "de.lovinoes.shad3",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      { "title": "shad3", "width": 1200, "height": 760, "minWidth": 760, "minHeight": 480, "dragDropEnabled": true, "decorations": false, "transparent": true }
+    ],
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self' data:; img-src 'self' data: blob: http://127.0.0.1:*; media-src 'self' http://127.0.0.1:*; connect-src 'self' http://127.0.0.1:*; worker-src 'self' blob:",
+      "dangerousDisableAssetCspModification": ["style-src"]
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["deb", "rpm", "appimage", "nsis", "msi"],
+    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.png", "icons/icon.ico"],
+    "category": "Utility",
+    "shortDescription": "Simple, fast S3 browser"
+  }
+}
