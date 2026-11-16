@@ -1,10 +1,23 @@
 # shad3
 
-A simple S3 browser for Linux (and Windows), styled to match my site ([lovinoes.de](https://lovinoes.de)).
+> [!WARNING]
+> This app is fully vibecoded: it was written by AI (Claude Opus 5.5, using the ponytail skill) and only parts of it were reviewed by a human. Use it at your own risk.
 
-Works with AWS S3 and anything S3-compatible: Cloudflare R2, Backblaze B2, Hetzner, Wasabi, MinIO etc.
+A simple S3 browser for Linux (and Windows). I made it for myself: I needed a better S3 browser than the ones out there, they're all shit, so I vibecoded my own.
+
+It should work with standard S3 providers like AWS, Cloudflare R2, Backblaze B2, Hetzner, Wasabi or MinIO. I only tested it on Datalix Object Storage.
 
 Built with Tauri, Rust and React. x64 only.
+
+## Features
+
+- Browse, upload, download, rename and delete files and folders (drag & drop works too)
+- Built-in viewers for pictures, videos, audio, PDFs and spreadsheets
+- Built-in text editor, or open files in your own apps (VLC, your editor, ...)
+- File properties and metadata
+- Activity history
+- Secret keys stored in your system keyring
+- Light and dark theme
 
 ## Building
 
