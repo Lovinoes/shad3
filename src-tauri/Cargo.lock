@@ -4159,6 +4159,7 @@ dependencies = [
  "futures",
  "gtk",
  "keyring",
+ "md-5",
  "mime_guess",
  "serde",
  "serde_json",

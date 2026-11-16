@@ -8,7 +8,7 @@ mod s3;
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -336,6 +336,13 @@ async fn object_info(app: State<'_, App>, id: String, key: String) -> Res<s3::Ob
     s3::info(&c, &bucket, &key).await
 }
 
+/// `uploads`: (key, upload id) pairs to abort.
+#[tauri::command]
+async fn abort_uploads(app: State<'_, App>, id: String, uploads: Vec<(String, String)>) -> Res<usize> {
+    let (c, bucket) = app.conn(&id)?;
+    s3::abort(&c, &bucket, uploads).await
+}
+
 #[tauri::command]
 async fn create_file(app: State<'_, App>, id: String, key: String) -> Res<()> {
     let (c, bucket) = app.conn(&id)?;
@@ -583,6 +590,8 @@ struct Tick {
     total: u64,
     files: u64,
     files_total: u64,
+    /// Uploads: (key, bytes, total) per top-level item, for the rows in the file list.
+    items: Vec<(String, u64, u64)>,
 }
 
 /// Runs `work` while sending the progress counters to the UI four times a second.
@@ -593,6 +602,7 @@ async fn with_progress<T>(prog: &Progress, ch: &Channel<Tick>, work: impl Future
             total: prog.total.load(Ordering::Relaxed),
             files: prog.files.load(Ordering::Relaxed),
             files_total: prog.files_total.load(Ordering::Relaxed),
+            items: prog.items.iter().map(|(k, done, total)| (k.clone(), done.load(Ordering::Relaxed), *total)).collect(),
         });
     };
     let ticker = async {
@@ -665,7 +675,15 @@ async fn upload(
             other => return Err(format!("Unknown conflict decision {other}")),
         }
     }
-    let prog = Arc::new(Progress::default());
+    let mut items: Vec<(String, AtomicU64, u64)> = Vec::new();
+    for f in &files {
+        let top = s3::top_key(&prefix, &f.1);
+        match items.iter_mut().find(|i| i.0 == top) {
+            Some(i) => i.2 += f.2,
+            None => items.push((top, AtomicU64::new(0), f.2)),
+        }
+    }
+    let prog = Arc::new(Progress { items, ..Default::default() });
     let _registered = Registered::new(&app, transfer_id, prog.clone());
     prog.total.store(files.iter().map(|f| f.2).sum(), Ordering::Relaxed);
     // Folder entries (empty folders, key ending in "/") are created, not counted as files.
@@ -685,6 +703,32 @@ async fn upload(
         return Err(s3::CANCELLED.into());
     }
     Ok(failed)
+}
+
+/// Continues an unfinished upload from the local file at `path`.
+#[tauri::command]
+async fn resume_upload(
+    app: State<'_, App>,
+    id: String,
+    key: String,
+    upload_id: String,
+    path: PathBuf,
+    transfer_id: String,
+    on_progress: Channel<Tick>,
+) -> Res<Vec<String>> {
+    let (c, bucket) = app.conn(&id)?;
+    let size = std::fs::metadata(&path).map_err(|e| e.to_string())?.len();
+    let prog = Arc::new(Progress { items: vec![(key.clone(), AtomicU64::new(0), size)], ..Default::default() });
+    let _registered = Registered::new(&app, transfer_id, prog.clone());
+    prog.total.store(size, Ordering::Relaxed);
+    prog.files_total.store(1, Ordering::Relaxed);
+    let r = with_progress(&prog, &on_progress, s3::resume(&c, &bucket, &key, &upload_id, &path, size, &prog)).await;
+    if prog.cancelled.load(Ordering::Relaxed) {
+        return Err(s3::CANCELLED.into());
+    }
+    r?;
+    prog.files.fetch_add(1, Ordering::Relaxed);
+    Ok(Vec::new())
 }
 
 /// Downloads into `dest`; returns the files that failed.
@@ -744,6 +788,7 @@ fn main() {
             delete,
             rename,
             upload,
+            resume_upload,
             upload_conflicts,
             cancel_transfer,
             download,
@@ -761,6 +806,7 @@ fn main() {
             write_text,
             create_file,
             object_info,
+            abort_uploads,
             open_external
         ])
         .run(tauri::generate_context!())

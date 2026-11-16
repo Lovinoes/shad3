@@ -15,6 +15,8 @@ type Toast = { id: number; msg: string; kind: "error" | "ok"; leaving?: boolean 
 type Transfer = {
   id: string;
   label: string;
+  /** The bucket (profile id) an upload goes to, so its file list can show it. */
+  bucketId?: string;
   tick?: Tick;
   state: "running" | "cancelling" | "cancelled" | "done" | "error";
   errors: string[];
@@ -131,10 +133,10 @@ export default function App() {
   }, []);
   const logRef = useRef(log);
 
-  const runTransfer: RunTransfer = useCallback(async (label, fn) => {
+  const runTransfer: RunTransfer = useCallback(async (label, fn, bucketId) => {
     const id = `t${++seq.current}`;
     const patch = (p: Partial<Transfer>) => setTransfers((ts) => ts.map((t) => (t.id === id ? { ...t, ...p } : t)));
-    setTransfers((ts) => [...ts, { id, label, state: "running", errors: [] }]);
+    setTransfers((ts) => [...ts, { id, label, bucketId, state: "running", errors: [] }]);
     const ch = new Channel<Tick>();
     ch.onmessage = (tick) => patch({ tick });
     try {
@@ -217,7 +219,16 @@ export default function App() {
 
       {/* main */}
       {current ? (
-        <Browser key={current.id} profile={current} settings={settings} notify={notify} log={log} runTransfer={runTransfer} onEdit={() => setDialog({ editing: current })} />
+        <Browser
+          key={current.id}
+          profile={current}
+          settings={settings}
+          notify={notify}
+          log={log}
+          runTransfer={runTransfer}
+          uploading={transfers.filter((t) => t.bucketId === current.id && t.state === "running").flatMap((t) => t.tick?.items ?? [])}
+          onEdit={() => setDialog({ editing: current })}
+        />
       ) : (
         <div className="flex flex-1 animate-rise flex-col items-center justify-center gap-4 p-8 text-center">
           {profiles === null ? (

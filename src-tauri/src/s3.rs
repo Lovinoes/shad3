@@ -272,6 +272,8 @@ pub struct Entry {
     pub is_dir: bool,
     pub size: i64,
     pub modified: Option<i64>,
+    /// Set for an unfinished multipart upload (shown as a red row; `modified` is when it started).
+    pub upload_id: Option<String>,
 }
 
 /// One folder level, like a file manager shows it.
@@ -293,6 +295,7 @@ pub async fn list(c: &Client, bucket: &str, prefix: &str) -> Result<Vec<Entry>, 
                 is_dir: true,
                 size: 0,
                 modified: None,
+                upload_id: None,
             });
         }
         for o in page.contents() {
@@ -306,10 +309,31 @@ pub async fn list(c: &Client, bucket: &str, prefix: &str) -> Result<Vec<Entry>, 
                 is_dir: false,
                 size: o.size().unwrap_or(0),
                 modified: o.last_modified().and_then(|d| d.to_millis().ok()),
+                upload_id: None,
             });
         }
     }
+    // Servers without ListMultipartUploads (or without permission for it) just show none.
+    add_unfinished(&mut out, prefix, unfinished(c, bucket, prefix).await.unwrap_or_default());
     Ok(out)
+}
+
+/// Unfinished uploads in this folder become rows; deeper ones make their folder show up, so a
+/// folder holding only a broken upload can still be opened.
+fn add_unfinished(out: &mut Vec<Entry>, prefix: &str, uploads: Vec<Unfinished>) {
+    let mut dirs: HashSet<String> = out.iter().filter(|e| e.is_dir).map(|e| e.key.clone()).collect();
+    for u in uploads {
+        let Some(rest) = u.key.strip_prefix(prefix) else { continue };
+        match rest.split_once('/') {
+            None => out.push(Entry { name: rest.into(), key: u.key, is_dir: false, size: 0, modified: u.initiated, upload_id: Some(u.upload_id) }),
+            Some((dir, _)) => {
+                let key = format!("{prefix}{dir}/");
+                if dirs.insert(key.clone()) {
+                    out.push(Entry { key, name: dir.into(), is_dir: true, size: 0, modified: None, upload_id: None });
+                }
+            }
+        }
+    }
 }
 
 /// Every object under a prefix (recursive), as (key, size).
@@ -364,7 +388,13 @@ async fn delete_keys(c: &Client, bucket: &str, keys: Vec<String>) -> Result<usiz
 
 pub async fn delete(c: &Client, bucket: &str, keys: &[String]) -> Result<usize, String> {
     let all = expand(c, bucket, keys).await?;
-    delete_keys(c, bucket, all.into_iter().map(|(k, _)| k).collect()).await
+    let n = delete_keys(c, bucket, all.into_iter().map(|(k, _)| k).collect()).await?;
+    // Unfinished uploads inside a deleted folder go too, or the folder would stay listed.
+    for k in keys.iter().filter(|k| k.ends_with('/')) {
+        let ups = unfinished(c, bucket, k).await.unwrap_or_default();
+        abort(c, bucket, ups.into_iter().map(|u| (u.key, u.upload_id)).collect()).await?;
+    }
+    Ok(n)
 }
 
 /// Percent-encodes "bucket/key" for the x-amz-copy-source header.
@@ -424,11 +454,23 @@ pub struct Progress {
     pub files_total: AtomicU64,
     /// Set by the cancel button; transfers stop at the next file, part or chunk.
     pub cancelled: AtomicBool,
+    /// Uploads: bytes per uploaded top-level item (a file, or a folder key ending in "/"),
+    /// so the file list can show each one's progress.
+    pub items: Vec<(String, AtomicU64, u64)>,
 }
 
 pub const CANCELLED: &str = "Cancelled";
 
 impl Progress {
+    /// Counts `n` transferred bytes of the object `key`.
+    fn add(&self, key: &str, n: u64) {
+        self.bytes.fetch_add(n, Ordering::Relaxed);
+        let mine = |item: &str| key == item || (item.ends_with('/') && key.starts_with(item));
+        if let Some((_, done, _)) = self.items.iter().find(|(item, ..)| mine(item)) {
+            done.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
     fn check(&self) -> Result<(), String> {
         if self.cancelled.load(Ordering::Relaxed) { Err(CANCELLED.into()) } else { Ok(()) }
     }
@@ -468,6 +510,15 @@ pub fn collect_uploads(paths: &[PathBuf], prefix: &str) -> Result<Vec<(PathBuf, 
     Ok(out)
 }
 
+/// The item an uploaded key belongs to in the folder it was dropped into: the file itself, or
+/// its top folder ("docs/up/sub/a.txt" uploaded into "docs/" belongs to "docs/up/").
+pub fn top_key(prefix: &str, key: &str) -> String {
+    match key[prefix.len()..].find('/') {
+        Some(i) => key[..prefix.len() + i + 1].to_owned(),
+        None => key.to_owned(),
+    }
+}
+
 /// Uploads one entry from `collect_uploads`: a file, or a folder marker for an empty folder.
 pub async fn upload_entry(c: &Client, bucket: &str, path: &Path, key: &str, size: u64, prog: &Progress) -> Result<(), String> {
     if key.ends_with('/') { create_folder(c, bucket, key).await } else { upload_file(c, bucket, path, key, size, prog).await }
@@ -479,16 +530,38 @@ pub async fn upload_file(c: &Client, bucket: &str, path: &Path, key: &str, size:
     if size < MULTIPART_THRESHOLD {
         let body = ByteStream::from_path(path).await.map_err(|e| e.to_string())?;
         c.put_object().bucket(bucket).key(key).content_type(mime).body(body).send().await.map_err(fmt_err)?;
-        prog.bytes.fetch_add(size, Ordering::Relaxed);
+        prog.add(key, size);
         return Ok(());
     }
     // S3 allows at most 10,000 parts.
     let part = MIN_PART.max(size.div_ceil(10_000));
     let up = c.create_multipart_upload().bucket(bucket).key(key).content_type(mime).send().await.map_err(fmt_err)?;
     let upload_id = up.upload_id().ok_or("Server returned no upload id")?;
-    let result = stream::iter(0..size.div_ceil(part))
+    let done = finish_multipart(c, bucket, path, key, size, part, upload_id, Vec::new(), prog).await;
+    if done.is_err() && prog.cancelled.load(Ordering::Relaxed) {
+        let _ = c.abort_multipart_upload().bucket(bucket).key(key).upload_id(upload_id).send().await;
+    }
+    done
+}
+
+/// Uploads the parts not in `have` and completes the upload. On errors the uploaded parts stay,
+/// so it shows up as unfinished and can be resumed.
+#[allow(clippy::too_many_arguments)]
+async fn finish_multipart(
+    c: &Client,
+    bucket: &str,
+    path: &Path,
+    key: &str,
+    size: u64,
+    part: u64,
+    upload_id: &str,
+    have: Vec<CompletedPart>,
+    prog: &Progress,
+) -> Result<(), String> {
+    let missing: Vec<u64> = (0..size.div_ceil(part)).filter(|i| !have.iter().any(|p| p.part_number() == Some(*i as i32 + 1))).collect();
+    let result = stream::iter(missing)
         .map(|i| async move {
-            prog.check()?; // a cancel aborts the multipart upload below, so no parts linger
+            prog.check()?;
             let len = part.min(size - i * part);
             let body = ByteStream::read_from()
                 .path(path)
@@ -499,14 +572,17 @@ pub async fn upload_file(c: &Client, bucket: &str, path: &Path, key: &str, size:
                 .map_err(|e| e.to_string())?;
             let n = i as i32 + 1;
             let r = c.upload_part().bucket(bucket).key(key).upload_id(upload_id).part_number(n).body(body).send().await.map_err(fmt_err)?;
-            prog.bytes.fetch_add(len, Ordering::Relaxed);
+            prog.add(key, len);
             Ok::<_, String>(CompletedPart::builder().part_number(n).set_e_tag(r.e_tag().map(str::to_owned)).build())
         })
         .buffered(PARALLEL)
         .try_collect::<Vec<_>>()
         .await;
-    let done = match result {
-        Ok(parts) => c
+    match result {
+        Ok(mut parts) => {
+            parts.extend(have);
+            parts.sort_by_key(|p| p.part_number());
+            c
             .complete_multipart_upload()
             .bucket(bucket)
             .key(key)
@@ -515,14 +591,59 @@ pub async fn upload_file(c: &Client, bucket: &str, path: &Path, key: &str, size:
             .send()
             .await
             .map(|_| ())
-            .map_err(fmt_err),
+            .map_err(fmt_err)
+        }
         Err(e) => Err(e),
-    };
-    if done.is_err() {
-        // Orphaned parts cost money on most providers.
-        let _ = c.abort_multipart_upload().bucket(bucket).key(key).upload_id(upload_id).send().await;
     }
-    done
+}
+
+/// Continues an unfinished upload from the local file it came from. Checks the parts already
+/// uploaded against the file first, so a wrong file can't produce a corrupt object.
+pub async fn resume(c: &Client, bucket: &str, key: &str, upload_id: &str, path: &Path, size: u64, prog: &Progress) -> Result<(), String> {
+    let (mut parts, mut marker) = (Vec::new(), None);
+    loop {
+        let r = c.list_parts().bucket(bucket).key(key).upload_id(upload_id).set_part_number_marker(marker).send().await.map_err(fmt_err)?;
+        parts.extend(r.parts().iter().filter_map(|p| Some((p.part_number()?, p.size()? as u64, p.e_tag()?.to_owned()))));
+        marker = r.next_part_number_marker().map(Into::into);
+        if !r.is_truncated().unwrap_or(false) || marker.is_none() {
+            break;
+        }
+    }
+    let sizes: Vec<(i32, u64)> = parts.iter().map(|p| (p.0, p.1)).collect();
+    let part = resume_part_size(&sizes, size).ok_or("This file doesn't match the unfinished upload (different size).")?;
+    let mut file = tokio::fs::File::open(path).await.map_err(|e| e.to_string())?;
+    for (n, len, etag) in &parts {
+        prog.check()?;
+        let etag = etag.trim_matches('"');
+        // shortcut: ETags that aren't a plain MD5 (e.g. SSE-KMS) are only checked by size.
+        if etag.len() == 32 && etag.bytes().all(|b| b.is_ascii_hexdigit()) {
+            use md5::Digest;
+            use tokio::io::{AsyncReadExt, AsyncSeekExt};
+            let mut buf = vec![0; *len as usize];
+            file.seek(std::io::SeekFrom::Start((*n as u64 - 1) * part)).await.map_err(|e| e.to_string())?;
+            file.read_exact(&mut buf).await.map_err(|e| e.to_string())?;
+            let md5: String = md5::Md5::digest(&buf).iter().map(|b| format!("{b:02x}")).collect();
+            if !md5.eq_ignore_ascii_case(etag) {
+                return Err("This file doesn't match the unfinished upload (its contents differ).".into());
+            }
+        }
+        prog.add(key, *len);
+    }
+    let have = parts.into_iter().map(|(n, _, etag)| CompletedPart::builder().part_number(n).e_tag(etag).build()).collect();
+    finish_multipart(c, bucket, path, key, size, part, upload_id, have, prog).await
+}
+
+/// The part size an unfinished upload of a `size`-byte file used, judged by its uploaded
+/// (part number, length) pairs: every part is full except the file's last one. Tries shad3's
+/// own size first, since the largest part can be the short last one (parts finish out of order).
+/// None when neither fits a file of that size.
+fn resume_part_size(parts: &[(i32, u64)], size: u64) -> Option<u64> {
+    let fits = |part: u64| {
+        let count = size.div_ceil(part.max(1));
+        part > 0 && count <= 10_000 && parts.iter().all(|&(n, len)| n >= 1 && (n as u64) <= count && len == part.min(size - (n as u64 - 1) * part))
+    };
+    let ours = MIN_PART.max(size.div_ceil(10_000));
+    [Some(ours), parts.iter().map(|p| p.1).max()].into_iter().flatten().find(|&p| fits(p))
 }
 
 pub async fn exists(c: &Client, bucket: &str, key: &str) -> Result<bool, String> {
@@ -638,6 +759,48 @@ pub async fn info(c: &Client, bucket: &str, key: &str) -> Result<ObjectInfo, Str
         metadata: h.metadata().map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()).unwrap_or_default(),
         ..Default::default()
     })
+}
+
+/// A multipart upload that was started but never completed or aborted (e.g. after a crash or a
+/// lost connection). Its parts still use storage, and a bucket can't be deleted while it exists.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Unfinished {
+    pub key: String,
+    pub upload_id: String,
+    pub initiated: Option<i64>,
+}
+
+/// Unfinished uploads whose key starts with `prefix` ("" for the whole bucket).
+pub async fn unfinished(c: &Client, bucket: &str, prefix: &str) -> Result<Vec<Unfinished>, String> {
+    let (mut out, mut key, mut id) = (Vec::new(), None, None);
+    loop {
+        let r = c.list_multipart_uploads().bucket(bucket).prefix(prefix).set_key_marker(key).set_upload_id_marker(id).send().await.map_err(fmt_err)?;
+        out.extend(r.uploads().iter().filter_map(|u| {
+            Some(Unfinished { key: u.key()?.into(), upload_id: u.upload_id()?.into(), initiated: u.initiated().and_then(|d| d.to_millis().ok()) })
+        }));
+        (key, id) = (r.next_key_marker().map(Into::into), r.next_upload_id_marker().map(Into::into));
+        // No paginator for this call in the SDK; stop when the server says so or gives no next page.
+        if !r.is_truncated().unwrap_or(false) || (key.is_none() && id.is_none()) {
+            return Ok(out);
+        }
+    }
+}
+
+/// Aborts unfinished uploads as (key, upload id); one that's already gone counts as done.
+pub async fn abort(c: &Client, bucket: &str, uploads: Vec<(String, String)>) -> Result<usize, String> {
+    let n = uploads.len();
+    stream::iter(uploads)
+        .map(|(key, id)| async move {
+            match c.abort_multipart_upload().bucket(bucket).key(key).upload_id(id).send().await {
+                Err(e) if e.code() != Some("NoSuchUpload") => Err(fmt_err(e)),
+                _ => Ok(()),
+            }
+        })
+        .buffer_unordered(16)
+        .try_collect::<Vec<_>>()
+        .await?;
+    Ok(n)
 }
 
 /// Largest file the built-in editor opens.
@@ -764,7 +927,7 @@ pub async fn download_file(c: &Client, bucket: &str, key: &str, dest: &Path, pro
             prog.check()?; // removes the .part file below
             let chunk = chunk.map_err(|e| format!("Download interrupted: {e}"))?;
             f.write_all(&chunk).await.map_err(|e| e.to_string())?;
-            prog.bytes.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+            prog.add(key, chunk.len() as u64);
         }
         f.flush().await.map_err(|e| e.to_string())?;
         tokio::fs::rename(&tmp, dest).await.map_err(|e| e.to_string())
@@ -803,6 +966,24 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resume_part_size_fits_the_file() {
+        const M: u64 = 1024 * 1024;
+        // 40 MB in 16 MB parts: 16, 16, 8. Parts 1 and 3 made it.
+        assert_eq!(resume_part_size(&[(1, 16 * M), (3, 8 * M)], 40 * M), Some(16 * M));
+        assert_eq!(resume_part_size(&[(2, 16 * M)], 40 * M), Some(16 * M));
+        // Only the short last part made it: not mistaken for 8 MB parts.
+        assert_eq!(resume_part_size(&[(3, 8 * M)], 40 * M), Some(16 * M));
+        // Another tool's 5 MB parts.
+        assert_eq!(resume_part_size(&[(1, 5 * M), (2, 5 * M)], 40 * M), Some(5 * M));
+        // Nothing uploaded yet: the normal part size.
+        assert_eq!(resume_part_size(&[], 40 * M), Some(MIN_PART));
+        // Other file size: the last part's length or the part count doesn't fit.
+        assert_eq!(resume_part_size(&[(1, 16 * M), (3, 8 * M)], 41 * M), None);
+        assert_eq!(resume_part_size(&[(1, 16 * M), (4, 16 * M)], 40 * M), None);
+        assert_eq!(resume_part_size(&[(1, 16 * M)], 8 * M), None);
+    }
 
     #[test]
     fn helpers() {
@@ -844,6 +1025,21 @@ mod tests {
         ];
         assert_eq!(got, want.map(|(k, s)| (k.to_string(), s)));
         std::fs::remove_dir_all(&tmp).unwrap();
+        // Unfinished uploads: rows in their folder, deeper ones only make their folder appear.
+        let up = |key: &str, id: &str| Unfinished { key: key.into(), upload_id: id.into(), initiated: Some(1) };
+        let mut rows = vec![Entry { key: "m/old/".into(), name: "old".into(), is_dir: true, size: 0, modified: None, upload_id: None }];
+        add_unfinished(&mut rows, "m/", vec![up("m/a.mkv", "u1"), up("m/a.mkv", "u2"), up("m/new/b.mkv", "u3"), up("m/old/c.mkv", "u4"), up("x/d", "u5")]);
+        let got: Vec<_> = rows.iter().map(|e| (e.name.as_str(), e.is_dir, e.upload_id.as_deref())).collect();
+        assert_eq!(got, [("old", true, None), ("a.mkv", false, Some("u1")), ("a.mkv", false, Some("u2")), ("new", true, None)]);
+        assert_eq!(top_key("docs/", "docs/up/sub/a.txt"), "docs/up/");
+        assert_eq!(top_key("docs/", "docs/a.txt"), "docs/a.txt");
+        assert_eq!(top_key("", "empty/"), "empty/");
+        let prog = Progress { items: vec![("d/a".into(), AtomicU64::new(0), 9), ("d/f/".into(), AtomicU64::new(0), 9)], ..Default::default() };
+        prog.add("d/f/x/y.bin", 5);
+        prog.add("d/a", 2);
+        prog.add("d/ab", 1); // a different file that only starts like "d/a"
+        let done: Vec<u64> = prog.items.iter().map(|(_, d, _)| d.load(Ordering::Relaxed)).collect();
+        assert_eq!((done, prog.bytes.load(Ordering::Relaxed)), (vec![2, 5], 8));
         assert_eq!(numbered("a/photo.jpg", 1), "a/photo (1).jpg");
         assert_eq!(numbered("archive.tar.gz", 2), "archive.tar (2).gz");
         assert_eq!(numbered("x/Makefile", 1), "x/Makefile (1)");
@@ -914,6 +1110,13 @@ mod tests {
 
         let c = p.client();
         let b = p.bucket.as_str();
+        let broken = c.create_multipart_upload().bucket(b).key("half.bin").send().await.unwrap();
+        let upload_id = broken.upload_id().unwrap().to_string();
+        let found = unfinished(&c, b, "").await.unwrap();
+        assert_eq!(found.iter().map(|u| (u.key.as_str(), u.upload_id.as_str())).collect::<Vec<_>>(), [("half.bin", upload_id.as_str())]);
+        assert_eq!(abort(&c, b, vec![("half.bin".into(), upload_id.clone())]).await.unwrap(), 1);
+        assert!(unfinished(&c, b, "").await.unwrap().is_empty());
+        assert_eq!(abort(&c, b, vec![("half.bin".into(), upload_id)]).await.unwrap(), 1); // already gone: fine
         let dir = std::env::temp_dir().join(format!("s3b-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("up/sub")).unwrap();
@@ -928,6 +1131,25 @@ mod tests {
             upload_entry(&c, b, &path, &key, size, &prog).await.unwrap();
         }
         assert_eq!(prog.bytes.load(Ordering::Relaxed), big.len() as u64 + 5);
+
+        // Resume: only part 2 of 3 made it. A different file is refused, the right one completes it.
+        const M: usize = 16 * 1024 * 1024;
+        let up = c.create_multipart_upload().bucket(b).key("resumed.bin").send().await.unwrap();
+        let id = up.upload_id().unwrap();
+        let body = ByteStream::from(big[M..2 * M].to_vec());
+        c.upload_part().bucket(b).key("resumed.bin").upload_id(id).part_number(2).body(body).send().await.unwrap();
+        let mut other = big.clone();
+        other[M + 7] ^= 1;
+        std::fs::write(dir.join("other.bin"), &other).unwrap();
+        let size = big.len() as u64;
+        let err = resume(&c, b, "resumed.bin", id, &dir.join("other.bin"), size, &Progress::default()).await.unwrap_err();
+        assert!(err.contains("contents differ"), "{err}");
+        let p2 = Progress::default();
+        resume(&c, b, "resumed.bin", id, &dir.join("up/sub/big.bin"), size, &p2).await.unwrap();
+        assert_eq!(p2.bytes.load(Ordering::Relaxed), size);
+        let got = c.get_object().bucket(b).key("resumed.bin").send().await.unwrap().body.collect().await.unwrap().into_bytes();
+        assert!(got == big, "resumed object differs");
+        c.delete_object().bucket(b).key("resumed.bin").send().await.unwrap();
 
         let names = |v: Vec<Entry>| v.into_iter().map(|e| (e.name, e.is_dir)).collect::<Vec<_>>();
         assert_eq!(names(list(&c, b, "").await.unwrap()), [("docs".into(), true)]);

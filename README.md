@@ -15,6 +15,7 @@ Built with Tauri, Rust and React. x64 only.
 - Built-in viewers for pictures, videos, audio, PDFs and spreadsheets
 - Built-in text editor, or open files in your own apps (VLC, your editor, ...)
 - File properties and metadata
+- Unfinished (broken) multipart uploads show up as red files you can resume or delete
 - Activity history
 - Secret keys stored in your system keyring
 - Light and dark theme
@@ -48,11 +49,13 @@ To build the `.rpm`, `.deb` and AppImage (they end up in `src-tauri/target/relea
 npm run tauri build -- --bundles rpm,deb,appimage
 ```
 
-The Windows installers are built by GitHub Actions. Push a tag like `v0.1.0` or run the workflow by hand.
+GitHub Actions builds everything, Windows included. Tags like `v0.1.0` become releases.
 
 ## Good to know
 
 - Secret keys are stored in your system keyring (GNOME Keyring, KWallet, or Credential Manager on Windows). Everything else is in `~/.config/de.lovinoes.shad3/`.
+- The `.rpm` from releases is signed. Import the key once before installing it:
+  `sudo rpm --import https://github.com/Lovinoes/shad3/releases/latest/download/RPM-GPG-KEY-shad3`
 - Videos play with your system's codecs. On Fedora, H.264 and H.265 need the codecs from RPM Fusion.
 
 ## Tests

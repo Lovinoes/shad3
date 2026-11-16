@@ -9,6 +9,7 @@ import {
   ChevronRight,
   Download,
   File,
+  FileX,
   FileCode,
   FilePlus,
   Folder,
@@ -33,7 +34,8 @@ import { PropertiesDialog } from "./PropertiesDialog";
 import { Button, Checkbox, ConfirmDialog, Input, MOTION_MS, Presence, PromptDialog, cn } from "./ui";
 
 /** Runs a transfer with progress in the sidebar; resolves with the files that failed. */
-export type RunTransfer = (label: string, fn: (ch: Channel<Tick>, transferId: string) => Promise<string[]>) => Promise<string[]>;
+/** `bucketId` marks an upload, so that bucket's file list can show its progress. */
+export type RunTransfer = (label: string, fn: (ch: Channel<Tick>, transferId: string) => Promise<string[]>, bucketId?: string) => Promise<string[]>;
 type Notify = (msg: string, kind?: "error" | "ok") => void;
 type SortKey = "name" | "size" | "modified";
 
@@ -42,6 +44,9 @@ const BINARY = new Set(
   "zip tar gz tgz bz2 xz zst 7z rar iso img dmg pdf doc docx xls xlsx ppt pptx odt ods odp exe dll so dylib bin dat class jar war apk aab deb rpm msi pkg woff woff2 ttf otf eot psd ai sketch fig xcf blend parquet avro orc sqlite sqlite3 db mdb pyc o a lib wasm".split(" "),
 );
 const ext = (name: string) => (name.lastIndexOf(".") > 0 ? name.slice(name.lastIndexOf(".") + 1).toLowerCase() : "");
+
+/** Row identity for selection: the key, or the upload id for an unfinished upload (a key can have several). */
+const rid = (e: Entry) => (e.uploadId ? `upload:${e.uploadId}` : e.key);
 
 // shortcut: renders at most this many rows; virtualize the list if huge folders must be scrolled instead of filtered.
 const MAX_ROWS = 3000;
@@ -52,6 +57,7 @@ export function Browser({
   notify,
   runTransfer,
   log,
+  uploading,
   onEdit,
 }: {
   profile: Profile;
@@ -59,6 +65,8 @@ export function Browser({
   notify: Notify;
   runTransfer: RunTransfer;
   log: Log;
+  /** [key, bytes, total] of items being uploaded into this bucket. */
+  uploading: [string, number, number][];
   onEdit: () => void;
 }) {
   const id = profile.id;
@@ -81,21 +89,52 @@ export function Browser({
   const listRef = useRef<HTMLDivElement>(null);
   const loadSeq = useRef(0);
 
-  const load = useCallback(async () => {
+  const busy = useRef(false);
+  const lastCount = useRef(0);
+  /** `quiet`: the live refresh; no spinner, keeps the list on errors, skips while a check runs. */
+  const load = useCallback(async (quiet = false) => {
+    // shortcut: huge folders aren't live (each check would be many list calls); F5 still works.
+    if (quiet && (busy.current || lastCount.current > MAX_ROWS)) return;
     const seq = ++loadSeq.current;
-    setLoading(true);
+    busy.current = true;
+    if (!quiet) setLoading(true);
     try {
       const list = await api.list(id, prefix);
       if (seq !== loadSeq.current) return; // a newer folder was opened meanwhile
       setEntries(list);
+      lastCount.current = list.length;
       setError(null);
-      setSelected((sel) => new Set(list.filter((e) => sel.has(e.key)).map((e) => e.key)));
+      setSelected((sel) => new Set(list.filter((e) => sel.has(rid(e))).map(rid)));
     } catch (e) {
-      if (seq === loadSeq.current) setError(errText(e));
+      if (seq === loadSeq.current && !quiet) setError(errText(e));
     } finally {
-      if (seq === loadSeq.current) setLoading(false);
+      if (seq === loadSeq.current) {
+        setLoading(false);
+        busy.current = false;
+      }
     }
   }, [id, prefix]);
+
+  // Live view: quietly re-check the open folder while the window is in use, and on coming back.
+  useEffect(() => {
+    const check = () => document.hasFocus() && !document.hidden && actRef.current.load(true);
+    const t = setInterval(check, 5000);
+    addEventListener("focus", check);
+    return () => {
+      clearInterval(t);
+      removeEventListener("focus", check);
+    };
+  }, []);
+
+  // Uploads into this folder: [bytes, total] by key; shown as rows until they exist.
+  const pending = new Map(
+    uploading
+      .filter(([k]) => k.startsWith(prefix) && !k.slice(prefix.length, -1).includes("/"))
+      .map(([k, bytes, total]) => [k, [bytes, total]] as const),
+  );
+  const pendingKeys = [...pending.keys()].join("\n");
+  /** Rows of uploads still running: shown, but not selectable (resuming or deleting one would break it). */
+  const busyRow = (e: Entry) => e.pending || pending.has(e.key);
 
   useEffect(() => {
     load();
@@ -112,7 +151,11 @@ export function Browser({
   const rows = useMemo(() => {
     const f = filter.trim().toLowerCase();
     const dir = sort.asc ? 1 : -1;
-    return entries
+    const known = new Set(entries.map((e) => e.key));
+    const extra: Entry[] = (pendingKeys ? pendingKeys.split("\n") : [])
+      .filter((k) => !known.has(k))
+      .map((k) => ({ key: k, name: k.slice(prefix.length).replace(/\/$/, ""), isDir: k.endsWith("/"), size: 0, modified: null, pending: true }));
+    return [...entries, ...extra]
       .filter((e) => !f || e.name.toLowerCase().includes(f))
       .sort((a, b) => {
         if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
@@ -120,12 +163,15 @@ export function Browser({
           sort.key === "size" ? a.size - b.size : sort.key === "modified" ? (a.modified ?? 0) - (b.modified ?? 0) : 0;
         return (d || a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" })) * dir;
       });
-  }, [entries, filter, sort]);
-  const anchorAt = anchorKey === null ? -1 : rows.findIndex((r) => r.key === anchorKey);
+  }, [entries, filter, sort, pendingKeys, prefix]);
+  const anchorAt = anchorKey === null ? -1 : rows.findIndex((r) => rid(r) === anchorKey);
   const anchor = anchorAt >= 0 ? anchorAt : null;
-  const setAnchor = (i: number | null) => setAnchorKey(i === null ? null : (rows[i]?.key ?? null));
+  const setAnchor = (i: number | null) => setAnchorKey(i === null || !rows[i] ? null : rid(rows[i]));
 
-  const sel = rows.filter((e) => selected.has(e.key));
+  const sel = rows.filter((e) => !busyRow(e) && selected.has(rid(e)));
+  // Finished files and folders vs. unfinished uploads, which can only be deleted.
+  const real = sel.filter((e) => !e.uploadId);
+  const broken = sel.filter((e) => e.uploadId);
   const single = sel.length === 1 ? sel[0] : null;
 
   // ---- actions ----
@@ -147,7 +193,7 @@ export function Browser({
       return notify(`Could not check for existing files: ${errText(e)}`);
     }
     const label = paths.length === 1 ? paths[0].split(/[\\/]/).pop()! : `${paths.length} items`;
-    const failed = await runTransfer(`Upload ${label}`, (ch, tid) => api.upload(id, paths, target, decisions, tid, ch));
+    const failed = await runTransfer(`Upload ${label}`, (ch, tid) => api.upload(id, paths, target, decisions, tid, ch), id);
     const cancelled = failed[0] === CANCELLED;
     log({
       action: "upload",
@@ -157,6 +203,21 @@ export function Browser({
       ok: !failed.length,
     });
     actRef.current.load(); // the folder shown now, which may not be the one uploaded into
+  };
+  /** Continues an unfinished upload; the server checks the picked file is the same one. */
+  const resume = async (e: Entry) => {
+    const path = await openDialog({ title: `Pick the local copy of ${e.name}` });
+    if (typeof path !== "string") return;
+    const failed = await runTransfer(`Resume ${e.name}`, (ch, tid) => api.resumeUpload(id, e.key, e.uploadId!, path, tid, ch), id);
+    const cancelled = failed[0] === CANCELLED;
+    log({
+      action: "upload",
+      bucket: profile.bucket,
+      summary: cancelled ? `Cancelled resuming ${e.name}` : failed.length ? `Could not resume ${e.name}` : `Resumed upload of ${e.name}`,
+      detail: cancelled ? "It stays unfinished and can be resumed again" : failed[0] ?? `to /${e.key}`,
+      ok: !failed.length,
+    });
+    actRef.current.load();
   };
   const pickUpload = async (directory: boolean) => {
     const res = await openDialog({ multiple: true, directory, title: directory ? "Upload folders" : "Upload files" });
@@ -212,16 +273,18 @@ export function Browser({
       setOpening(null);
     }
   };
-  const media = useMemo(() => rows.filter((r) => !r.isDir && mediaKind(r.name)), [rows]);
+  const media = useMemo(() => rows.filter((r) => !r.isDir && !r.uploadId && mediaKind(r.name)), [rows]);
   const view = (e: Entry) => setViewing(media.findIndex((m) => m.key === e.key));
   const kindOf = (e: Entry): FileKind => mediaKind(e.name) ?? (BINARY.has(ext(e.name)) ? "other" : "text");
   // The built-in editor has a size limit; an external app gets any text file (SVG is text too).
   const canEdit = (e: Entry) =>
-    !e.isDir && (kindOf(e) === "text" || ext(e.name) === "svg") && (opener(settings, "text").mode !== "builtin" || e.size <= MAX_EDIT);
-  const canOpen = (e: Entry) => e.isDir || kindOf(e) !== "text" && (kindOf(e) !== "other" || opener(settings, "other").mode !== "download");
+    !e.isDir &&
+    !e.uploadId && (kindOf(e) === "text" || ext(e.name) === "svg") && (opener(settings, "text").mode !== "builtin" || e.size <= MAX_EDIT);
+  const canOpen = (e: Entry) => e.isDir || !e.uploadId && kindOf(e) !== "text" && (kindOf(e) !== "other" || opener(settings, "other").mode !== "download");
   /** Double-click / Enter: folders open, everything else goes where Settings → Open with says. */
   const openEntry = (e: Entry) => {
     if (e.isDir) return go(e.key);
+    if (e.uploadId) return resume(e);
     const kind = kindOf(e);
     const { mode } = opener(settings, kind);
     if (mode === "system" || mode === "custom") return external(e, kind);
@@ -271,7 +334,10 @@ export function Browser({
       setBand(r);
       const next = new Set(base);
       list.querySelectorAll<HTMLElement>("[data-i]").forEach((el) => {
-        if (el.offsetTop < r.y + r.h && el.offsetTop + el.offsetHeight > r.y) next.add(rows[+el.dataset.i!].key);
+        if (el.offsetTop < r.y + r.h && el.offsetTop + el.offsetHeight > r.y) {
+          const e = rows[+el.dataset.i!];
+          if (!busyRow(e)) next.add(rid(e));
+        }
       });
       setSelected(next);
     };
@@ -315,14 +381,14 @@ export function Browser({
     if (suppressClick.current) return;
     if (e.shiftKey && anchor !== null) {
       const [a, b] = [Math.min(anchor, i), Math.max(anchor, i)];
-      setSelected(new Set(rows.slice(a, b + 1).map((r) => r.key)));
+      setSelected(new Set(rows.slice(a, b + 1).map(rid)));
     } else if (e.ctrlKey || e.metaKey) {
       const next = new Set(selected);
-      next.has(entry.key) ? next.delete(entry.key) : next.add(entry.key);
+      next.has(rid(entry)) ? next.delete(rid(entry)) : next.add(rid(entry));
       setSelected(next);
       setAnchor(i);
     } else {
-      setSelected(new Set([entry.key]));
+      setSelected(new Set([rid(entry)]));
       setAnchor(i);
     }
   };
@@ -331,18 +397,18 @@ export function Browser({
   const onKey = (e: React.KeyboardEvent) => {
     const k = e.key;
     if (k === "Delete" && sel.length) setDialog("delete");
-    else if (k === "F2" && single) setDialog("rename");
-    else if (k === "Enter" && e.altKey && single) setProperties(single);
+    else if (k === "F2" && single && !single.uploadId) setDialog("rename");
+    else if (k === "Enter" && e.altKey && single && !single.uploadId) setProperties(single);
     else if (k === "Enter" && single) openEntry(single);
     else if ((k === "Backspace" || (e.altKey && k === "ArrowUp")) && prefix) go(parent);
-    else if (k === "a" && (e.ctrlKey || e.metaKey)) setSelected(new Set(rows.map((r) => r.key)));
+    else if (k === "a" && (e.ctrlKey || e.metaKey)) setSelected(new Set(rows.filter((e) => !busyRow(e)).map(rid)));
     else if (k === "Escape") setSelected(new Set());
     else if (k === "F5") load();
     else if (k === "ArrowDown" || k === "ArrowUp") {
       const cur = anchor ?? -1;
       const i = Math.max(0, Math.min(rows.length - 1, cur + (k === "ArrowDown" ? 1 : -1)));
       if (!rows[i]) return;
-      setSelected(new Set([rows[i].key]));
+      setSelected(new Set([rid(rows[i])]));
       setAnchor(i);
       listRef.current?.querySelector(`[data-i="${i}"]`)?.scrollIntoView({ block: "nearest" });
     } else return;
@@ -378,7 +444,7 @@ export function Browser({
           <Search className="pointer-events-none absolute top-2.5 left-2.5 size-4 text-muted-foreground" />
           <Input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="Filter" className="h-9 pl-8" aria-label="Filter this folder" />
         </div>
-        <Button variant="outline" size="icon" className="size-9" onClick={load} aria-label="Refresh" title="Refresh (F5)">
+        <Button variant="outline" size="icon" className="size-9" onClick={() => load()} aria-label="Refresh" title="Refresh (F5)">
           <RefreshCw className={cn(loading && "animate-spin")} />
         </Button>
         <Button variant="outline" className="px-2.5 @3xl:px-4" onClick={() => setDialog("folder")} title="New folder" aria-label="New folder">
@@ -400,9 +466,11 @@ export function Browser({
       >
         <div className="flex items-center gap-1 rounded-lg border bg-popover p-1.5 pl-3 text-sm shadow-2xl">
           <span className="mr-1 whitespace-nowrap text-muted-foreground">{sel.length} selected</span>
-          <Button variant="ghost" size="sm" onClick={() => download(sel)} title="Download">
-            <Download /> <span className="hidden @2xl:inline">Download</span>
-          </Button>
+          {real.length > 0 && (
+            <Button variant="ghost" size="sm" onClick={() => download(real)} title="Download">
+              <Download /> <span className="hidden @2xl:inline">Download</span>
+            </Button>
+          )}
           {single && canOpen(single) && (
             <Button variant="ghost" size="sm" onClick={() => openEntry(single)} title="Open">
               <FolderOpen /> <span className="hidden @2xl:inline">Open</span>
@@ -413,7 +481,7 @@ export function Browser({
               <FileCode /> <span className="hidden @2xl:inline">Edit</span>
             </Button>
           )}
-          {single && (
+          {single && !single.uploadId && (
             <Button variant="ghost" size="sm" onClick={() => setDialog("rename")} title="Rename">
               <Pencil /> <span className="hidden @2xl:inline">Rename</span>
             </Button>
@@ -446,7 +514,7 @@ export function Browser({
         <div className="sticky top-0 z-10 grid grid-cols-[1rem_1fr_6rem] @2xl:grid-cols-[1rem_1fr_7rem_11rem] items-center gap-3 border-b bg-background px-4 py-2 text-xs font-medium text-muted-foreground">
           <Checkbox
             checked={allState}
-            onChange={(v) => setSelected(v ? new Set(rows.map((r) => r.key)) : new Set())}
+            onChange={(v) => setSelected(v ? new Set(rows.filter((e) => !busyRow(e)).map(rid)) : new Set())}
             label={allState === true ? "Deselect all" : "Select all"}
             className={cn(!rows.length && "invisible")}
           />
@@ -466,7 +534,7 @@ export function Browser({
           <Empty>
             <p className="max-w-md text-destructive">{error}</p>
             <div className="flex gap-2">
-              <Button variant="outline" onClick={load}>
+              <Button variant="outline" onClick={() => load()}>
                 Retry
               </Button>
               <Button variant="outline" onClick={onEdit}>
@@ -484,41 +552,61 @@ export function Browser({
           </Empty>
         ) : (
           <>
-            {rows.slice(0, MAX_ROWS).map((e, i) => (
+            {rows.slice(0, MAX_ROWS).map((e, i) => {
+              const up = pending.get(e.key);
+              const pct = up && up[1] ? Math.floor((up[0] / up[1]) * 100) : 0;
+              return (
               <div
-                key={e.key}
+                key={rid(e)}
                 data-i={i}
                 role="row"
-                aria-selected={selected.has(e.key)}
+                aria-selected={selected.has(rid(e))}
                 onClick={(ev) => click(ev, e, i)}
                 onDoubleClick={() => openEntry(e)}
-                onContextMenu={() => !selected.has(e.key) && (setSelected(new Set([e.key])), setAnchor(i))}
+                onContextMenu={() => !selected.has(rid(e)) && (setSelected(new Set([rid(e)])), setAnchor(i))}
+                title={
+                  up
+                    ? `Uploading… ${formatSize(up[0])} of ${formatSize(up[1])} (${pct}%)`
+                    : e.uploadId
+                      ? "Unfinished upload: it never completed. Resume it from the local file, or delete it to free the space it uses."
+                      : undefined
+                }
                 className={cn(
                   "group grid grid-cols-[1rem_1fr_6rem] @2xl:grid-cols-[1rem_1fr_7rem_11rem] items-center gap-3 px-4 py-1.5 text-sm transition-colors",
-                  selected.has(e.key) ? "bg-accent" : "hover:bg-accent/50",
+                  selected.has(rid(e)) ? "bg-accent" : "hover:bg-accent/50",
+                  e.uploadId && !up && "text-destructive",
+                  up && "opacity-60",
+                  busyRow(e) && "pointer-events-none",
                 )}
               >
                 {/* Like Explorer: shown on hover, and on every row once anything is selected. */}
                 <Checkbox
-                  checked={selected.has(e.key)}
-                  onChange={() => toggle(e.key, i)}
+                  checked={selected.has(rid(e))}
+                  onChange={() => toggle(rid(e), i)}
                   label={`Select ${e.name}`}
-                  className={cn(!sel.length && "opacity-0 group-hover:opacity-100 focus-visible:opacity-100")}
+                  className={cn(!sel.length && "opacity-0 group-hover:opacity-100 focus-visible:opacity-100", busyRow(e) && "invisible")}
                 />
                 <span className="flex min-w-0 items-center gap-2.5">
-                  {opening === e.key ? (
+                  {opening === e.key || up ? (
                     <LoaderCircle className="size-4 shrink-0 animate-spin text-muted-foreground" />
                   ) : e.isDir ? (
                     <Folder className="size-4 shrink-0 fill-current/20" />
+                  ) : e.uploadId ? (
+                    <FileX className="size-4 shrink-0" />
                   ) : (
                     <File className="size-4 shrink-0 text-muted-foreground" />
                   )}
                   <span className="truncate">{e.name || "(unnamed)"}</span>
                 </span>
-                <span className="text-right text-muted-foreground tabular-nums">{e.isDir ? "" : formatSize(e.size)}</span>
-                <span className="hidden truncate text-right text-muted-foreground tabular-nums @2xl:block">{e.modified ? new Date(e.modified).toLocaleString() : ""}</span>
+                <span className={cn("text-right tabular-nums", !e.uploadId && "text-muted-foreground")}>
+                  {up ? `${pct}%` : e.uploadId ? "Unfinished" : e.isDir ? "" : formatSize(e.size)}
+                </span>
+                <span className={cn("hidden truncate text-right tabular-nums @2xl:block", !e.uploadId && "text-muted-foreground")}>
+                  {up ? "Uploading…" : e.modified ? new Date(e.modified).toLocaleString() : ""}
+                </span>
               </div>
-            ))}
+              );
+            })}
             {rows.length > MAX_ROWS && (
               <p className="px-4 py-3 text-sm text-muted-foreground">
                 Showing {MAX_ROWS} of {rows.length} items. Use the filter to find the rest.
@@ -536,7 +624,8 @@ export function Browser({
       </div>
 
       <div className="border-t px-4 py-1.5 text-xs text-muted-foreground">
-        {entries.filter((e) => e.isDir).length} folders, {entries.filter((e) => !e.isDir).length} files,{" "}
+        {entries.filter((e) => e.isDir).length} folders, {entries.filter((e) => !e.isDir && !e.uploadId).length} files,{" "}
+        {entries.some((e) => e.uploadId) && `${entries.filter((e) => e.uploadId).length} unfinished, `}
         {formatSize(entries.reduce((n, e) => n + e.size, 0))}
       </div>
 
@@ -556,10 +645,11 @@ export function Browser({
             <>
               {single && canOpen(single) && <MenuItem icon={<FolderOpen />} label="Open" hint="Enter" onClick={() => openEntry(single)} />}
               {single && canEdit(single) && <MenuItem icon={<FileCode />} label="Edit" hint={canOpen(single) ? undefined : "Enter"} onClick={() => editFile(single)} />}
-              <MenuItem icon={<Download />} label="Download" onClick={() => download(sel)} />
-              {single && <MenuItem icon={<Pencil />} label="Rename" hint="F2" onClick={() => setDialog("rename")} />}
+              {real.length > 0 && <MenuItem icon={<Download />} label="Download" onClick={() => download(real)} />}
+              {single?.uploadId && <MenuItem icon={<Upload />} label="Resume upload…" hint="Enter" onClick={() => resume(single)} />}
+              {single && !single.uploadId && <MenuItem icon={<Pencil />} label="Rename" hint="F2" onClick={() => setDialog("rename")} />}
               <MenuItem icon={<Trash />} label="Delete" hint="Del" danger onClick={() => setDialog("delete")} />
-              {single && <MenuItem icon={<Info />} label="Properties" hint="Alt+Enter" onClick={() => setProperties(single)} />}
+              {single && !single.uploadId && <MenuItem icon={<Info />} label="Properties" hint="Alt+Enter" onClick={() => setProperties(single)} />}
             </>
           ) : (
             <>
@@ -567,7 +657,7 @@ export function Browser({
               <MenuItem icon={<FolderPlus />} label="New folder" onClick={() => setDialog("folder")} />
               <MenuItem icon={<Upload />} label="Upload files" onClick={() => pickUpload(false)} />
               <MenuItem icon={<FolderUp />} label="Upload folders" onClick={() => pickUpload(true)} />
-              <MenuItem icon={<RefreshCw />} label="Refresh" hint="F5" onClick={load} />
+              <MenuItem icon={<RefreshCw />} label="Refresh" hint="F5" onClick={() => load()} />
             </>
           )}
         </ContextMenu>
@@ -681,6 +771,7 @@ export function Browser({
         body={
           <>
             {sel.some((e) => e.isDir) && "Folders are deleted with everything inside them. "}
+            {broken.length > 0 && "Unfinished uploads are removed and can't be resumed. "}
             This cannot be undone.
           </>
         }
@@ -688,9 +779,11 @@ export function Browser({
         onConfirm={async () => {
           const what = sel.length === 1 ? sel[0].name : `${sel.length} items`;
           try {
-            const n = await api.delete(id, sel.map((e) => e.key));
-            notify(`Deleted ${n} object${n === 1 ? "" : "s"}`, "ok");
-            log({ action: "delete", bucket: profile.bucket, summary: `Deleted ${what}`, detail: `${n} object${n === 1 ? "" : "s"} in /${prefix}`, ok: true });
+            const n = real.length ? await api.delete(id, real.map((e) => e.key)) : 0;
+            const m = broken.length ? await api.abortUploads(id, broken.map((e) => [e.key, e.uploadId!])) : 0;
+            const done = [n && `${n} object${n === 1 ? "" : "s"}`, m && `${m} unfinished upload${m === 1 ? "" : "s"}`].filter(Boolean).join(" and ");
+            notify(`Deleted ${done}`, "ok");
+            log({ action: "delete", bucket: profile.bucket, summary: `Deleted ${what}`, detail: `${done} in /${prefix}`, ok: true });
           } catch (e) {
             notify(errText(e));
             log({ action: "delete", bucket: profile.bucket, summary: `Could not delete ${what}`, detail: errText(e), ok: false });

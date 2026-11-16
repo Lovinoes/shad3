@@ -11,10 +11,15 @@ export type Profile = {
   pathStyle: boolean;
 };
 
-export type Entry = { key: string; name: string; isDir: boolean; size: number; modified: number | null };
+/**
+ * `uploadId` marks an unfinished multipart upload (a red row; `modified` is when it started).
+ * `pending`: shown while it is still being uploaded, before it exists in the bucket.
+ */
+export type Entry = { key: string; name: string; isDir: boolean; size: number; modified: number | null; uploadId?: string | null; pending?: boolean };
 export type TestResult = { ok: boolean; message: string; bucketMissing: boolean; fixed?: Profile | null };
 export type ConflictMode = "replace" | "rename" | "skip";
-export type Tick = { bytes: number; total: number; files: number; filesTotal: number };
+/** `items`: uploads only, [key, bytes, total] per top-level file or folder (key ending in "/"). */
+export type Tick = { bytes: number; total: number; files: number; filesTotal: number; items: [string, number, number][] };
 
 export type FileKind = "text" | "image" | "video" | "audio" | "pdf" | "sheet" | "other";
 export type OpenMode = "builtin" | "system" | "custom" | "download";
@@ -45,6 +50,7 @@ export const api = {
   systemTheme: () => invoke<string>("system_theme"),
   openUrl: (url: string) => invoke<void>("open_url", { url }),
   createFile: (id: string, key: string) => invoke<void>("create_file", { id, key }),
+  abortUploads: (id: string, uploads: [string, string][]) => invoke<number>("abort_uploads", { id, uploads }),
   objectInfo: (id: string, key: string) => invoke<import("./PropertiesDialog").ObjectInfo>("object_info", { id, key }),
   getProfiles: () => invoke<Profile[]>("get_profiles"),
   saveProfile: (profile: Profile) => invoke<Profile>("save_profile", { profile }),
@@ -59,6 +65,8 @@ export const api = {
   /** `decisions`: what to do per already-existing key. */
   upload: (id: string, paths: string[], prefix: string, decisions: Record<string, ConflictMode>, transferId: string, onProgress: Channel<Tick>) =>
     invoke<string[]>("upload", { id, paths, prefix, decisions, transferId, onProgress }),
+  resumeUpload: (id: string, key: string, uploadId: string, path: string, transferId: string, onProgress: Channel<Tick>) =>
+    invoke<string[]>("resume_upload", { id, key, uploadId, path, transferId, onProgress }),
   cancelTransfer: (transferId: string) => invoke<void>("cancel_transfer", { transferId }),
   download: (id: string, keys: string[], dest: string, transferId: string, onProgress: Channel<Tick>) =>
     invoke<string[]>("download", { id, keys, dest, transferId, onProgress }),
